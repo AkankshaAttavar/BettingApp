@@ -1,28 +1,22 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-
-interface IERC20 {
-    function transferFrom(
-        address from,
-        address to,
-        uint256 amount
-    ) external returns (bool);
-    function transfer(address to, uint256 amount) external returns (bool);
-}
+import "lib/openzeppelin-contracts/contracts/utils/ReentrancyGuard.sol";
+import "lib/openzeppelin-contracts/contracts/token/ERC20/IERC20.sol";
 
 contract BettingApp is ReentrancyGuard {
     address public owner;
-    uint public betCount;
+    uint256 public betCount;
     IERC20 public betToken;
-    uint public bettingFeePercent = 2; // 2% fee to owner
+    uint256 public bettingFeePercent = 2;
 
+    // Enums
     enum Option {
         optionA,
         optionB
     }
 
+    // Structs
     struct BetRequest {
         address user;
         string betName;
@@ -38,22 +32,23 @@ contract BettingApp is ReentrancyGuard {
         string optionB;
         bool isActive;
         bool isClosed;
-        uint deadline;
+        uint256 deadline;
         address[] participants;
         Option winner;
         uint256 totalPool;
         uint256 winnerCount;
     }
 
-    mapping(uint => Bet) public activeBets;
-    mapping(uint => mapping(address => Option)) public userBets;
-    mapping(uint => mapping(address => bool)) public hasBet;
+    mapping(uint256 => Bet) public activeBets;
+    mapping(uint256 => mapping(address => Option)) public userBets;
+    mapping(uint256 => mapping(address => bool)) public hasBet;
     BetRequest[] public betRequests;
 
     error OnlyOwner(address caller);
     error NotWinner();
     error InvalidBetId();
     error BetNotActive();
+    error BetStillOpen();
     error BetAlreadyClosed();
     error AlreadyPlacedBet();
     error NoWinners();
@@ -63,7 +58,13 @@ contract BettingApp is ReentrancyGuard {
     event BetRequested(address user, string optionA, string optionB);
     event BetCreated(uint256 betId, string betName);
     event BetPlaced(uint256 betId, address user, Option optionSelected);
-    event BetClosed(uint256 betId, Option winner, uint256 rewardPerWinner);
+    event BetClosed(uint256 betId);
+    event WinnerPicked(uint256 betId, Option winningOption);
+    event WinnerRecievedReward(
+        uint256 betId,
+        address participant,
+        uint256 reward
+    );
     event FeeCollected(address to, uint256 amount);
 
     modifier onlyOwner() {
@@ -94,6 +95,15 @@ contract BettingApp is ReentrancyGuard {
         return true;
     }
 
+    function getAllRequestedBets()
+        public
+        view
+        onlyOwner
+        returns (BetRequest[] memory)
+    {
+        return betRequests;
+    }
+
     function createBet(
         uint256 requestIndex,
         uint256 durationInHours
@@ -116,28 +126,32 @@ contract BettingApp is ReentrancyGuard {
         betCount++;
     }
 
+    function getBetAmount() public pure returns (uint256) {
+        return 10 * 10 ** 18;
+    }
+
     function placeBets(
         uint256 betId,
         Option selectedOption,
         uint256 amount
     ) public nonReentrant {
-        if (betId >= betCount) revert InvalidBetId();
-
         Bet storage bet = activeBets[betId];
+        if (bet.user == address(0)) revert InvalidBetId();
+
         if (!bet.isActive) revert BetNotActive();
         if (bet.isClosed) revert BetAlreadyClosed();
         if (block.timestamp >= bet.deadline) revert BetDeadlinePassed();
         if (hasBet[betId][msg.sender]) revert AlreadyPlacedBet();
-        require(amount >= 10 * 10 ** 18, "Minimum 10 BET");
+        require(amount == 10 * 10 ** 18, "BET OF 10 Token is only valid");
 
+        uint256 fee = (amount * bettingFeePercent) / 100;
+        uint256 amountAfterFee = amount - fee;
         require(
             betToken.transferFrom(msg.sender, address(this), amount),
             "Token transfer failed"
         );
-
-        uint256 fee = (amount * bettingFeePercent) / 100;
-        uint256 amountAfterFee = amount - fee;
         require(betToken.transfer(owner, fee), "Fee transfer failed");
+
         emit FeeCollected(owner, fee);
 
         userBets[betId][msg.sender] = selectedOption;
@@ -148,19 +162,28 @@ contract BettingApp is ReentrancyGuard {
         emit BetPlaced(betId, msg.sender, selectedOption);
     }
 
-    function ownerCloseBet(
-        uint256 betId,
-        Option winningOption
-    ) public onlyOwner nonReentrant {
-        if (betId >= betCount) revert InvalidBetId();
-
+    function closeBet(uint256 betId) public onlyOwner {
         Bet storage bet = activeBets[betId];
+        if (bet.user == address(0)) revert InvalidBetId();
+
         if (!bet.isActive) revert BetNotActive();
         if (bet.isClosed) revert BetAlreadyClosed();
         if (block.timestamp < bet.deadline) revert BetDeadlinePassed();
 
         bet.isActive = false;
         bet.isClosed = true;
+        emit BetClosed(betId);
+    }
+
+    function declareWinners(
+        uint256 betId,
+        Option winningOption
+    ) public onlyOwner {
+        Bet storage bet = activeBets[betId];
+        if (bet.user == address(0)) revert InvalidBetId();
+
+        if (!bet.isClosed) revert BetStillOpen();
+
         bet.winner = winningOption;
 
         uint256 winners = 0;
@@ -169,8 +192,10 @@ contract BettingApp is ReentrancyGuard {
                 winners++;
             }
         }
+        emit WinnerPicked(betId, winningOption);
 
         if (winners == 0) revert NoWinners();
+
         bet.winnerCount = winners;
         uint256 reward = bet.totalPool / winners;
 
@@ -181,10 +206,9 @@ contract BettingApp is ReentrancyGuard {
                     betToken.transfer(participant, reward),
                     "Reward transfer failed"
                 );
+                emit WinnerRecievedReward(betId, participant, reward);
             }
         }
-
-        emit BetClosed(betId, winningOption, reward);
     }
 
     function getParticipants(
